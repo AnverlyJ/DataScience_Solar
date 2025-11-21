@@ -1,1 +1,98 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.preprocessing.sequence import TimeseriesGenerator
+import matplotlib.pyplot as plt
 
+
+df = pd.read_csv("household_data_60min_singleindex.csv",
+                 index_col=0,
+                 parse_dates=True)
+
+df.index.freq = "H"
+
+# ---------- INPUTS & TARGETS ----------
+input_features = [
+    "DE_KN_residential3_circulation_pump",
+    "DE_KN_residential3_freezer",
+    "DE_KN_residential3_dishwasher"
+]
+
+target_features = input_features   # predicting all 3
+
+
+# Build dataset
+data = df[input_features]
+
+
+# ---------- TRAIN/TEST SPLIT ----------
+split = int(len(data) * 0.8)
+train = data.iloc[:split]
+test = data.iloc[split:]
+
+
+# ---------- SCALING ----------
+scaler = MinMaxScaler()
+scaled_train = scaler.fit_transform(train)
+scaled_test = scaler.transform(test)
+
+
+# ---------- TIME-SERIES GENERATOR ----------
+n_input = 24
+n_features = len(input_features)
+
+generator = TimeseriesGenerator(
+    scaled_train,
+    scaled_train,     # predict ALL 3 values
+    length=n_input,
+    batch_size=32
+)
+
+
+# ---------- MODEL ----------
+model = Sequential()
+model.add(LSTM(64, activation='relu',
+               input_shape=(n_input, n_features)))
+model.add(Dense(3))   # output 3 predictions
+model.compile(optimizer='adam', loss='mse')
+model.summary()
+
+model.fit(generator, epochs=10)
+
+
+# ---------- PREDICTION LOOP ----------
+pred_scaled = []
+current_batch = scaled_train[-n_input:].reshape((1, n_input, n_features))
+
+for i in range(len(test)):
+    pred = model.predict(current_batch)[0]
+    pred_scaled.append(pred)
+
+    next_row = scaled_test[i]  # real future inputs
+    current_batch = np.append(
+        current_batch[:, 1:, :],
+        [[next_row]],
+        axis=1
+    )
+
+
+# ---------- INVERSE TRANSFORM ----------
+pred_scaled = np.array(pred_scaled)
+
+# pad zeros for inverse transform
+pad = np.zeros((len(pred_scaled), n_features))
+pad[:, :] = pred_scaled
+
+predictions = scaler.inverse_transform(pad)
+
+
+# ---------- PLOTS ----------
+for i, col in enumerate(target_features):
+    plt.figure(figsize=(12,5))
+    plt.plot(test.index, test[col], label="Actual")
+    plt.plot(test.index, predictions[:, i], label="Predicted")
+    plt.title(f"LSTM Forecast for {col}")
+    plt.legend()
+    plt.show()
