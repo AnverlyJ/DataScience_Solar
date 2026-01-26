@@ -1,98 +1,271 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 from tensorflow.keras.preprocessing.sequence import TimeseriesGenerator
 import matplotlib.pyplot as plt
 
 
+print("Household Energy Consumption LSTM Model")
+print("\nProblem: \n- Households struggle with high electricity bills\n- Consumers lack visibility into energy usage patterns\n- Traditional monitoring only shows past consumption, not future trends")
+print("\nSolution:\n- Predict future energy consumption for key appliances\n- Provide insights to optimize appliance usage and reduce costs")
+
+#load data
 df = pd.read_csv("household_data_60min_singleindex.csv",
                  index_col=0,
                  parse_dates=True)
 
-df.index.freq = "H"
+df.index.freq = "h"
 
-# ---------- INPUTS & TARGETS ----------
-input_features = [
+#appliances to target
+appliances = [
     "DE_KN_residential3_circulation_pump",
     "DE_KN_residential3_freezer",
     "DE_KN_residential3_dishwasher"
 ]
 
-target_features = input_features   # predicting all 3
+data = df[appliances].copy()
+
+#fill any missing values
+data = data.ffill().bfill()
+
+print(f" there are {len(data)} hours of consumption data \nMonitoring  the Circulation Pump, Freezer, Dishwasher\nData period:  from {data.index[0]} to {data.index[-1]}")
+
+print(f"\nEnergy consumption stats (Wh):")
+print(data.describe().round(2))
+
+# calculating cost per kh for client optimal savings(assuming $0.12/kWh)
+cost_per_kwh = 0.12
+hourly_cost = (data / 1000) * cost_per_kwh  # conversion (check)
+daily_cost = hourly_cost.resample('D').sum()
+monthly_cost = hourly_cost.resample('M').sum()
+
+print(f"\nEstimated electricity costs: \nAverage daily cost: ${daily_cost.sum(axis=1).mean():.2f}\nAverage monthly cost: ${monthly_cost.sum(axis=1).mean():.2f}")
+
+# training section (check)
+print("\nSplit data into training/testing sets")
+split_index = int(len(data) * 0.8)
+
+train = data.iloc[:split_index]
+test = data.iloc[split_index:]
+
+print(f" Training set: {len(train)} hours ({split_index/len(data)*100:.0f}%)")
+print(f"Testing set: {len(test)} hours ({(1-split_index/len(data))*100:.0f}%)")
 
 
-# Build dataset
-data = df[input_features]
-
-
-# ---------- TRAIN/TEST SPLIT ----------
-split = int(len(data) * 0.8)
-train = data.iloc[:split]
-test = data.iloc[split:]
-
-
-# ---------- SCALING ----------
+#scaling
 scaler = MinMaxScaler()
 scaled_train = scaler.fit_transform(train)
 scaled_test = scaler.transform(test)
 
+print(f"MinMax scaling:")
+print(f" Training data range: [{scaled_train.min():.2f}, {scaled_train.max():.2f}]")
+print(f" Testing data range: [{scaled_test.min():.2f}, {scaled_test.max():.2f}]")
 
-# ---------- TIME-SERIES GENERATOR ----------
-n_input = 24
-n_features = len(input_features)
 
-generator = TimeseriesGenerator(
+
+# create sequences using 24hrs history to predict the next hour
+lookback_hours = 24
+n_features = len(appliances)
+
+print(f"\nCreating time sequences")
+train_generator = TimeseriesGenerator(
     scaled_train,
-    scaled_train,     # predict ALL 3 values
-    length=n_input,
+    scaled_train,
+    length=lookback_hours,
     batch_size=32
 )
 
 
-# ---------- MODEL ----------
-model = Sequential()
-model.add(LSTM(64, activation='relu',
-               input_shape=(n_input, n_features)))
-model.add(Dense(3))   # output 3 predictions
-model.compile(optimizer='adam', loss='mse')
+#LSTM build
+model = Sequential([
+    LSTM(64, activation='relu', input_shape=(lookback_hours, n_features)),
+    Dense(n_features)
+])
+
+model.compile(
+    optimizer='adam', #(0.001)
+    loss='mse',
+    metrics=['mae']
+)
+
+# Model Architecture:
+# Layer 1: LSTM with 64 units
+# Layer 2: Dense output layer 
+# Optimizer: Adam
+# Loss function: MSE
 model.summary()
 
-model.fit(generator, epochs=10)
+
+#training
+print("\ntraining for 10 epochs")
+history = model.fit(
+    train_generator,
+    epochs=10,
+    verbose=1
+)
+print("training complete")
 
 
-# ---------- PREDICTION LOOP ----------
-pred_scaled = []
-current_batch = scaled_train[-n_input:].reshape((1, n_input, n_features))
+#predictions(check)
+print("\n Predictions for test period")
 
+predictions_scaled = []
+current_batch = scaled_train[-lookback_hours:].reshape((1, lookback_hours, n_features))
+
+#predict across testing period
 for i in range(len(test)):
-    pred = model.predict(current_batch)[0]
-    pred_scaled.append(pred)
-
-    next_row = scaled_test[i]  # real future inputs
+    pred = model.predict(current_batch, verbose=0)[0]
+    predictions_scaled.append(pred)
+    
+    #get sequence next value from actual next value
+    next_value = scaled_test[i]
     current_batch = np.append(
         current_batch[:, 1:, :],
-        [[next_row]],
+        [[next_value]],
         axis=1
     )
 
+#revert to scale for clear conversion
+predictions = scaler.inverse_transform(np.array(predictions_scaled))
+actuals = test.values
 
-# ---------- INVERSE TRANSFORM ----------
-pred_scaled = np.array(pred_scaled)
-
-# pad zeros for inverse transform
-pad = np.zeros((len(pred_scaled), n_features))
-pad[:, :] = pred_scaled
-
-predictions = scaler.inverse_transform(pad)
+print(f" {len(predictions)} hourly predictions")
 
 
-# ---------- PLOTS ----------
-for i, col in enumerate(target_features):
-    plt.figure(figsize=(12,5))
-    plt.plot(test.index, test[col], label="Actual")
-    plt.plot(test.index, predictions[:, i], label="Predicted")
-    plt.title(f"LSTM Forecast for {col}")
-    plt.legend()
+#evaluate data (check)
+print("Model Performance")
+
+total_actual = 0
+total_predicted = 0
+
+for i, appliance in enumerate(appliances):
+    actual_values = actuals[:, i]
+    predicted_values = predictions[:, i]
+    
+    mae = mean_absolute_error(actual_values, predicted_values)
+    rmse = np.sqrt(mean_squared_error(actual_values, predicted_values))
+    r2 = r2_score(actual_values, predicted_values)
+    
+    #handle zeros
+    non_zero_mask = actual_values > 10  
+    if non_zero_mask.any():
+        mape = np.mean(np.abs((actual_values[non_zero_mask] - predicted_values[non_zero_mask]) 
+                              / actual_values[non_zero_mask])) * 100
+    else:
+        mape = 0
+    
+    avg_actual = actual_values.mean()
+    avg_predicted = predicted_values.mean()
+    
+    total_actual += avg_actual
+    total_predicted += avg_predicted
+
+
+    #print stats on each appliance
+    print(f"\n{appliance.split('_')[-1].upper()}:")
+    print(f"  Average actual consumption:    {avg_actual:.2f} Wh/hour")
+    print(f"  Average predicted consumption: {avg_predicted:.2f} Wh/hour")
+    print(f"  Prediction accuracy (Rsquared):      {r2:.4f}")
+    print(f"  Mean Absolute Error:           {mae:.2f} Wh")
+    print(f"  Root Mean Squared Error:       {rmse:.2f} Wh")
+    print(f"  Mean Absolute % Error:         {mape:.2f}%")
+
+#client cost savings
+
+print("Analysis on cost")
+actual_cost = (actuals.sum(axis=1).sum() / 1000) * cost_per_kwh
+predicted_cost = (predictions.sum(axis=1).sum() / 1000) * cost_per_kwh
+print(f"Actual total cost over test period:     ${actual_cost:.2f}")
+print(f"Predicted total cost over test period:  ${predicted_cost:.2f}")
+print(f"Prediction error:                        ${abs(actual_cost - predicted_cost):.2f}")
+
+
+
+#visualization of data (check)
+
+# Training loss
+plt.figure(figsize=(10, 5))
+plt.plot(history.history['loss'], linewidth=2, color='blue')
+plt.title('Model Training Loss (MSE)', fontsize=14, fontweight='bold')
+plt.xlabel('Epoch')
+plt.ylabel('Mean Squared Error')
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Predictions vs Actual for each appliance
+for i, appliance in enumerate(appliances):
+    appliance_name = appliance.split('_')[-1].upper()
+    
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+    
+    # Full timeline
+    axes[0].plot(test.index, actuals[:, i], 
+                 label='Actual Consumption', linewidth=2, color='blue', alpha=0.8)
+    axes[0].plot(test.index, predictions[:, i], 
+                 label='Predicted Consumption', linewidth=2, color='purple', alpha=0.8)
+    axes[0].set_title(f'{appliance_name} - Energy Consumption Forecast', 
+                     fontsize=14, fontweight='bold')
+    axes[0].set_xlabel('Date', fontsize=11)
+    axes[0].set_ylabel('Power Consumption (Wh)', fontsize=11)
+    axes[0].legend(fontsize=10)
+    axes[0].grid(True, alpha=0.3)
+    
+    # Weekly detail view
+    week_hours = min(168, len(test))  # 7 days = 168 hours
+    axes[1].plot(test.index[:week_hours], actuals[:week_hours, i], 
+                 label='Actual', linewidth=2, color='blue', marker='o', markersize=4, alpha=0.8)
+    axes[1].plot(test.index[:week_hours], predictions[:week_hours, i], 
+                 label='Predicted', linewidth=2, color='purple', marker='s', markersize=4, alpha=0.8)
+    axes[1].set_title(f'{appliance_name} - First Week Detail View', 
+                     fontsize=14, fontweight='bold')
+    axes[1].set_xlabel('Date', fontsize=11)
+    axes[1].set_ylabel('Power Consumption (Wh)', fontsize=11)
+    axes[1].legend(fontsize=10)
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
     plt.show()
+
+# Combined appliances view
+plt.figure(figsize=(14, 6))
+plt.plot(test.index, actuals.sum(axis=1), 
+         label='Total Actual Consumption', linewidth=2.5, color='blue', alpha=0.8)
+plt.plot(test.index, predictions.sum(axis=1), 
+         label='Total Predicted Consumption', linewidth=2.5, color='purple', alpha=0.8)
+plt.title('Total Household Energy Consumption - All Appliances', 
+         fontsize=14, fontweight='bold')
+plt.xlabel('Date', fontsize=11)
+plt.ylabel('Total Power Consumption (Wh)', fontsize=11)
+plt.legend(fontsize=11)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Accuracy scatter plot
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for i, appliance in enumerate(appliances):
+    appliance_name = appliance.split('_')[-1].capitalize()
+    axes[i].scatter(actuals[:, i], predictions[:, i], alpha=0.4, s=20, color='orange')
+    
+    # Perfect prediction line
+    min_val = min(actuals[:, i].min(), predictions[:, i].min())
+    max_val = max(actuals[:, i].max(), predictions[:, i].max())
+    axes[i].plot([min_val, max_val], [min_val, max_val], 
+                'r--', linewidth=2, label='Perfect Prediction')
+    
+    axes[i].set_xlabel('Actual (Wh)', fontsize=10)
+    axes[i].set_ylabel('Predicted (Wh)', fontsize=10)
+    axes[i].set_title(f'{appliance_name}', fontsize=11, fontweight='bold')
+    axes[i].legend(fontsize=9)
+    axes[i].grid(True, alpha=0.3)
+
+plt.suptitle('Prediction Accuracy - Actual vs Predicted', fontsize=14, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.show()
+
+
+print("Program Complete!")
